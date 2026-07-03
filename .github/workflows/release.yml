@@ -1,0 +1,29 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            vsapstar
+            sap_audit_hook
+          body: |
+            Compiled binaries for Linux x86_64.
+
+            Requires: `<sid>adm` shell, `ptrace_scope` ≤ 1, SAP kernel 916.
+
+            See [README](README.md) for usage.
