@@ -15,6 +15,7 @@ This repository contains two tools that explore what happens when you look at th
 
 While playing around with the SAP Kernel Audit Log capabilities, I figured out how to selectively suppress audit events which caused me to build a second tool.
 
+![Demo Video](./demo_virtual_sapstar_attack.mp4)
 
 
 ## Tools
