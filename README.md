@@ -6,7 +6,7 @@
 >
 > Use only on systems you own or have explicit written authorization to test. If you use this to do something illegal, that is on you.
 >
-> This has been reported to SAP PSIRT and got rejected with the reason "Our analysis has determined that your submission is a false positive and does not have any security impact on SAP." 
+> This has been reported to SAP PSIRT and got rejected with the reason "Our analysis has determined that your submission is a false positive and *does not have any security impact on SAP*." [Full Statement here](https://github.com/randomstr1ng/virtual-sap-death-star#a-comment-from-the-sap-psirt) 
 
 ## What Is This
 
@@ -18,7 +18,8 @@ This repository contains two tools that explore what happens when you look at th
 
 While playing around with the SAP Kernel Audit Log capabilities, I figured out how to selectively suppress audit events which caused me to build a second tool.
 
-https://github.com/randomstr1ng/virtual-sap-death-star/blob/main/demo_virtual_sapstar_attack.mp4
+<video src="https://raw.githubusercontent.com/randomstr1ng/virtual-sap-death-star/main/demo_virtual_sapstar_attac
+k.mp4"></video>
 
 ## Tools
 
@@ -162,4 +163,7 @@ These findings were reported to SAP PSIRT in June 2026. SAP's response, in full:
 
 SAP is correct that `<sid>adm` OS access is a prerequisite. What the response does not address is that the feature ships with a profile parameter (`login/create_virtual_user_sapstar`) specifically intended to prevent this from working — and that parameter can be bypassed. It ships with an audit log entry specifically intended to record when this feature is used — and that entry can be suppressed. These are not properties of the underlying OS. They are properties of the SAP application.
 
-But per SAP PSIRT: false positive. So here we are - enjoy ;)
+But per SAP PSIRT: false positive.
+
+
+So here we are - enjoy ;)
