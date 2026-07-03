@@ -18,8 +18,7 @@ This repository contains two tools that explore what happens when you look at th
 
 While playing around with the SAP Kernel Audit Log capabilities, I figured out how to selectively suppress audit events which caused me to build a second tool.
 
-<video src="https://raw.githubusercontent.com/randomstr1ng/virtual-sap-death-star/main/demo_virtual_sapstar_attac
-k.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/6eb7c4eb-c9c3-4714-8601-5770083c8cd7
 
 ## Tools
 
