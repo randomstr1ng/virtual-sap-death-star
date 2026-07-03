@@ -9,15 +9,25 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Build
         run: make
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Update latest tag
+        run: |
+          git tag -f latest
+          git push origin latest --force
+
+      - uses: softprops/action-gh-release@v2
         with:
+          tag_name: latest
+          name: Latest
+          make_latest: true
           files: |
             vsapstar
             sap_audit_hook
