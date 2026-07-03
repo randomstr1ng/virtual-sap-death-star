@@ -3,7 +3,10 @@
 
 > [!IMPORTANT]  
 > This code was developed for security research purposes on systems the author was authorized to test.
+>
 > Use only on systems you own or have explicit written authorization to test. If you use this to do something illegal, that is on you.
+>
+> This has been reported to SAP PSIRT and got rejected with the reason "Our analysis has determined that your submission is a false positive and does not have any security impact on SAP." 
 
 ## What Is This
 
@@ -15,8 +18,7 @@ This repository contains two tools that explore what happens when you look at th
 
 While playing around with the SAP Kernel Audit Log capabilities, I figured out how to selectively suppress audit events which caused me to build a second tool.
 
-![Demo Video](./demo_virtual_sapstar_attack.mp4)
-
+https://github.com/randomstr1ng/virtual-sap-death-star/blob/main/demo_virtual_sapstar_attack.mp4
 
 ## Tools
 
