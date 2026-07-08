@@ -32,8 +32,15 @@ jobs:
             vsapstar
             sap_audit_hook
           body: |
-            Compiled binaries for Linux x86_64.
+            Compiled binaries for Linux x86_64. Statically linked — no glibc
+            version dependency, runs on any target (incl. older SLES).
 
-            Requires: `<sid>adm` shell, `ptrace_scope` ≤ 1, SAP kernel 916.
+            Requires: `<sid>adm` shell, `ptrace_scope` ≤ 1.
+
+            vsapstar resolves function addresses from the target disp+work's
+            ELF symtab at runtime (kernel-build independent). If that lookup
+            fails, it aborts rather than guessing — pass --force-legacy-offsets
+            to force the old kernel-916 hardcoded offsets (unsafe on other
+            kernel builds/releases).
 
             See [README](README.md) for usage.

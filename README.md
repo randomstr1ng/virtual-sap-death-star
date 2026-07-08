@@ -91,7 +91,9 @@ make sap_audit_hook
 make clean
 ```
 
-Requirements: `gcc`, Linux, glibc. No external dependencies.
+Requirements: `gcc`, Linux. Builds static by default (no glibc version
+dependency on the target — needed since dev/build box glibc is commonly
+newer than the target SAP host's, e.g. SLES15 SP6 ships glibc 2.31).
 
 ---
 
