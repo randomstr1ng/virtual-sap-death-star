@@ -50,6 +50,11 @@ login/create_virtual_user_sapstar=0 ignored
 > [!NOTE]  
 > Confirmed on SAP kernel 916 / S/4HANA 2023 and 2025, and separately on SAP kernel 7.93 PL101 (SLES15 SP6). The ELF-symbol-based resolution and live crash recovery are designed to generalize to other kernel builds/patch levels without code changes, but only these have been tested end-to-end.
 
+> [!IMPORTANT]  
+> **First-use requirement on a given SAP instance.** Password generation runs an HMAC key read from SAP's secure store (`RSecDReadItemEx`) and a related crypto self-test. On an instance where Virtual SAP\* has *never* been used before (by any means — real `dpmon` or otherwise) since the kernel processes started, that path depends on per-task dispatch context (session attach, DB connection state) that only gets established through SAP's real request dispatcher — which raw `ptrace` injection bypasses. Result: the very first attempt on a completely untouched instance can fail (`INTERNAL_ERR`, or a crash inside `LocFunc_FillEnqueStruct` recovered automatically — see `--no-patch-enque-crash`).
+>
+> This is not a bug in the tool, and not fixable by patching around it further — it's SAP's own dispatch requirement showing through. **Workaround:** run real `dpmon`'s create option *once* against the instance first (any client/validity, even one you immediately delete). Whatever gets warmed by that (secure-store key cache, crypto subsystem init) persists for the life of the kernel processes — every `vsapstar` call after that first real use works reliably, including the crash-recovery paths, which stop triggering at all once the state is warm.
+
 
 
 ### `sap_audit_hook` — SAP Security Audit Log Monitor
@@ -144,7 +149,7 @@ Typical usage:
 PW=$(./vsapstar -c 100 -v 10 -q)
 ```
 
-**Requires:** `<sid>adm` shell, `/proc/sys/kernel/yama/ptrace_scope` ≤ 1.
+**Requires:** `<sid>adm` shell, `/proc/sys/kernel/yama/ptrace_scope` ≤ 1, and Virtual SAP\* having been used at least once on this instance already (see the first-use note above — prime with one real `dpmon` create if it's a fresh instance).
 
 Run `./vsapstar -h` for the full option reference — each flag's help text explains what it does, why it exists, and (for the fallback/diagnostic ones) what was actually tested.
 

@@ -127,6 +127,43 @@
  * checked before anything is patched). */
 #define FILLENQUE_WINDOW 0x1000UL
 
+/* Pre-flight check (automatic, read-only): info_virtual_sapstar() returns
+ * std::vector<VIRTUAL_USER_INFO_STRUCT> — the same shared, system-wide
+ * virtual-users table create_virtual_user_internal's own (differently-typed)
+ * table search reads from. Purely informational: an earlier theory that a
+ * pre-existing entry here explains an otherwise-unexplained INTERNAL_ERR was
+ * tested and disproven (confirmed root cause instead: a real-dispatch-only
+ * dependency in password generation's secure-store key read — see the rc==1
+ * hint below). Kept because knowing the table's state is still useful
+ * context when debugging a failure, and it costs nothing extra. Advisory
+ * only: never blocks creation, and skips silently if either symbol doesn't
+ * resolve. */
+#define SYM_INFO_VSAPSTAR "info_virtual_sapstar"
+#define SYM_VEC_DTOR   "_ZNSt12_Vector_baseIN12SAP_KRN_SIGN24VIRTUAL_USER_INFO_STRUCTESaIS1_EED1Ev"
+/* Scratch offsets for the pre-flight check's throwaway std::vector output
+ * (24 bytes: begin/end/cap) and its second (purpose-unknown, generously
+ * sized) parameter — placed well clear of client_ptr/pw_ptr (+0x000/+0x100)
+ * and the null-safe buffer (+0x800) used by the enqueue-crash recovery. */
+#define PRECHECK_VEC_OFFSET 0x300UL
+#define PRECHECK_ARG_OFFSET 0x340UL
+
+/* Force the target's C locale to POSIX/"C" before calling (on by default,
+ * --no-force-locale to disable). Originally added on a plausible-looking
+ * empirical lead: a system where creation worked ran LANG=/LC_ALL=POSIX,
+ * one that failed with an unexplained INTERNAL_ERR ran LANG=C.UTF-8 — the
+ * only env difference found at the time, with our injected raw-UTF16LE data
+ * (every other byte 0x00) a reasonable-looking trigger for a UTF-8-
+ * validating locale. Tested and disproven: forcing the locale made no
+ * difference to that failure. Confirmed real root cause instead: a
+ * real-dispatch-only dependency in password generation's secure-store key
+ * read (see the rc==1 hint below), unrelated to locale entirely. Left in
+ * and on by default anyway since setlocale(LC_ALL,"C") is idempotent and
+ * process-global — genuinely harmless even though it isn't the fix for
+ * anything we've found. --no-force-locale disables it if you'd rather not
+ * touch the target's locale at all. */
+#define GLIBC_LC_ALL 6
+#define LOCALE_STR_OFFSET 0x3C0UL
+
 /* Sentinel DP_SESSION_INFO used by --set-session: matches the value ThStart's
  * own dispatch loop builds for this exact request path (external/admin
  * requests not tied to a specific ABAP user session) before looking up the
@@ -216,6 +253,95 @@ static void elf_resolve_symbols(const char *binary_path,
     }
     free(shdrs);
     close(fd);
+}
+
+/* Find the PLT stub's file-relative virtual address for an externally-
+ * imported symbol (one elf_resolve_symbols can't find, since it only scans
+ * SHT_SYMTAB/SHT_DYNSYM entries with a nonzero value — an imported symbol
+ * like setlocale shows up there as UNDEFINED/0). Parses .rela.plt + .dynsym
+ * (+ .plt.sec for IBT builds) to find the stub instead. Ported from
+ * sap_audit_hook.c's find_plt_entry (already solved this for fwrite there).
+ * Returns 0 if not found. */
+static uintptr_t find_plt_entry(const char *exepath, const char *symname) {
+    int fd = open(exepath, O_RDONLY);
+    if (fd < 0) return 0;
+    Elf64_Ehdr ehdr;
+    if (pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr)) { close(fd); return 0; }
+    Elf64_Shdr *shdrs = malloc((size_t)ehdr.e_shnum * sizeof(Elf64_Shdr));
+    if (!shdrs) { close(fd); return 0; }
+    if (pread(fd, shdrs, (size_t)ehdr.e_shnum * sizeof(Elf64_Shdr), ehdr.e_shoff)
+            != (ssize_t)((size_t)ehdr.e_shnum * sizeof(Elf64_Shdr))) {
+        free(shdrs); close(fd); return 0;
+    }
+
+    char *shstrtab = NULL;
+    if (ehdr.e_shstrndx < ehdr.e_shnum) {
+        Elf64_Shdr *ss = &shdrs[ehdr.e_shstrndx];
+        shstrtab = malloc(ss->sh_size);
+        if (shstrtab && pread(fd, shstrtab, ss->sh_size, ss->sh_offset) != (ssize_t)ss->sh_size) {
+            free(shstrtab); shstrtab = NULL;
+        }
+    }
+
+    Elf64_Shdr *plt_sh = NULL, *pltsec_sh = NULL, *relaplt_sh = NULL;
+    Elf64_Shdr *dynsym_sh = NULL, *dynstr_sh = NULL;
+    if (shstrtab) {
+        for (int i = 0; i < ehdr.e_shnum; i++) {
+            const char *sn = shstrtab + shdrs[i].sh_name;
+            if      (strcmp(sn, ".plt")      == 0) plt_sh     = &shdrs[i];
+            else if (strcmp(sn, ".plt.sec")  == 0) pltsec_sh  = &shdrs[i];
+            else if (strcmp(sn, ".rela.plt") == 0) relaplt_sh = &shdrs[i];
+            if (shdrs[i].sh_type == SHT_DYNSYM && !dynsym_sh) dynsym_sh = &shdrs[i];
+        }
+    }
+    if (dynsym_sh && dynsym_sh->sh_link < (uint32_t)ehdr.e_shnum)
+        dynstr_sh = &shdrs[dynsym_sh->sh_link];
+
+    uintptr_t result = 0;
+    if (relaplt_sh && dynsym_sh && dynstr_sh && (plt_sh || pltsec_sh)) {
+        size_t nrela = relaplt_sh->sh_size / sizeof(Elf64_Rela);
+        Elf64_Rela *relas   = malloc(relaplt_sh->sh_size);
+        Elf64_Sym  *dynsyms = malloc(dynsym_sh->sh_size);
+        char       *dynstr  = malloc(dynstr_sh->sh_size);
+        if (relas && dynsyms && dynstr
+                && pread(fd, relas,   relaplt_sh->sh_size, relaplt_sh->sh_offset) == (ssize_t)relaplt_sh->sh_size
+                && pread(fd, dynsyms, dynsym_sh->sh_size,  dynsym_sh->sh_offset)  == (ssize_t)dynsym_sh->sh_size
+                && pread(fd, dynstr,  dynstr_sh->sh_size,  dynstr_sh->sh_offset)  == (ssize_t)dynstr_sh->sh_size) {
+            size_t nsym = dynsym_sh->sh_size / sizeof(Elf64_Sym);
+            uintptr_t got_target = 0;
+            for (size_t j = 0; j < nrela && !got_target; j++) {
+                uint32_t si = ELF64_R_SYM(relas[j].r_info);
+                if (si == 0 || si >= nsym || dynsyms[si].st_name == 0) continue;
+                if (strcmp(dynstr + dynsyms[si].st_name, symname) != 0) continue;
+                got_target = relas[j].r_offset; /* GOT slot this reloc patches */
+            }
+            /* Don't trust index arithmetic to map a .rela.plt position onto a
+             * .plt entry — the assumed "PLT0 resolver, then 1:1" layout can be
+             * off by however many reserved/IFUNC-resolved entries a given
+             * toolchain places first (confirmed empirically: off by one entry
+             * on this exact binary). Instead scan .plt/.plt.sec for the actual
+             * `jmp *rel32(%rip)` stub whose *computed* target equals the GOT
+             * slot address the relocation says it patches — verified, not
+             * assumed, same philosophy as every other byte-scan in this tool. */
+            if (got_target) {
+                Elf64_Shdr *use = pltsec_sh ? pltsec_sh : plt_sh;
+                uint8_t *pltbuf = malloc(use->sh_size);
+                if (pltbuf && pread(fd, pltbuf, use->sh_size, use->sh_offset) == (ssize_t)use->sh_size) {
+                    for (size_t off = 0; off + 6 <= use->sh_size && !result; off++) {
+                        if (pltbuf[off] != 0xff || pltbuf[off + 1] != 0x25) continue;
+                        int32_t rel32; memcpy(&rel32, pltbuf + off + 2, 4);
+                        uintptr_t insn_addr = use->sh_addr + off;
+                        uintptr_t target = insn_addr + 6 + (intptr_t)rel32;
+                        if (target == got_target) result = insn_addr;
+                    }
+                }
+                free(pltbuf);
+            }
+        }
+        free(relas); free(dynsyms); free(dynstr);
+    }
+    free(shstrtab); free(shdrs); close(fd);
+    return result;
 }
 
 /* ── Find all disp+work PIDs ──────────────────────────────────────────── */
@@ -440,18 +566,47 @@ static uintptr_t find_syscall_site(pid_t pid, uintptr_t base, size_t scan) {
  * the exact shape of the crashing instruction inside LocFunc_FillEnqueStruct
  * (`41 8b 0b` = mov (%r11),%ecx) when it dereferences a null pointer read
  * from a per-task field that's only populated during real request dispatch.
- * Returns instruction length (3) if it matches, 0 otherwise.
+ * The code reads several consecutive fields off that same null pointer
+ * (`[r11]`, `[r11+4]`, `[r11+6]`, ...) via a mix of plain GPR loads (`8B`)
+ * and SSE loads (`0F 10`/`0F 6F`) with varying displacement sizes — patching
+ * one faulting instruction at a time can't keep up. Instead: decode which
+ * register is used as the memory *base* for the fault, confirm it's really
+ * null (0), and let the caller redirect that register to a small always-
+ * zero scratch buffer — every subsequent read through it, at any offset or
+ * instruction shape, then just succeeds against real (zeroed) memory.
+ * Deliberately refuses to decode SIB-addressed or rip-relative forms —
+ * doesn't match this crash's known shape, safer to refuse than guess.
+ * Returns 1 and sets *base_reg_idx (0-15, REX.B-extended) on match.
  */
-static int decode_simple_mov_load(const uint8_t *b) {
-    if ((b[0] & 0xf0) != 0x40) return 0;         /* REX prefix */
-    if (b[1] != 0x8b) return 0;                  /* MOV r, r/m */
-    uint8_t modrm = b[2];
+static int decode_mem_base_reg(const uint8_t *b, int *base_reg_idx) {
+    int i = 0;
+    int rex_b = 0;
+    if ((b[i] & 0xf0) == 0x40) { rex_b = b[i] & 0x1; i++; }
+    uint8_t op1 = b[i];
+    int modrm_idx;
+    if (op1 == 0x0f) {
+        uint8_t op2 = b[i + 1];
+        if (op2 != 0x10 && op2 != 0x6f) return 0; /* only known SSE load shapes */
+        modrm_idx = i + 2;
+    } else {
+        if (op1 != 0x8b) return 0;                /* only known GPR load shape */
+        modrm_idx = i + 1;
+    }
+    uint8_t modrm = b[modrm_idx];
     uint8_t mod = (modrm >> 6) & 0x3;
     uint8_t rm  = modrm & 0x7;
-    if (mod != 0) return 0;                      /* no displacement */
-    if (rm == 4 || rm == 5) return 0;             /* no SIB, no rip-relative */
-    return 3;
+    if (rm == 4) return 0;                        /* SIB present — don't handle */
+    if (mod == 0 && rm == 5) return 0;             /* rip-relative — don't handle */
+    *base_reg_idx = (rex_b << 3) | rm;
+    return 1;
 }
+
+/* Small dead zone inside the injected call's own scratch mmap, past our own
+ * client/pw_buf data (+0x000/+0x100) and far below the stack (which grows
+ * down from the top of SCRATCH_SIZE) — never written by us, so it stays
+ * zero-filled for the lifetime of the call. Used as a stand-in for a null
+ * pointer the target code expects to be valid. */
+#define NULL_SAFE_BUF_OFFSET 0x800UL
 
 static int call_in_target(pid_t pid, struct user_regs_struct *saved,
                            uintptr_t scratch_rw,  /* R/W data+stack page */
@@ -594,12 +749,11 @@ static int call_in_target(pid_t pid, struct user_regs_struct *saved,
 
             uint8_t ibuf[4] = {0};
             if (mem_read(pid, fr.rip, ibuf, sizeof(ibuf)) != 0) break;
-            int ilen = decode_simple_mov_load(ibuf);
-            if (!ilen) break; /* not the known shape — don't guess, treat as fatal */
+            int base_reg_idx;
+            if (!decode_mem_base_reg(ibuf, &base_reg_idx)) break; /* not the known shape — don't guess */
 
-            int reg_idx = ((ibuf[0] & 0x4) << 1) | ((ibuf[2] >> 3) & 0x7); /* REX.R:reg */
             unsigned long long *slot = NULL;
-            switch (reg_idx) {
+            switch (base_reg_idx) {
                 case 0: slot = (unsigned long long*)&fr.rax; break;
                 case 1: slot = (unsigned long long*)&fr.rcx; break;
                 case 2: slot = (unsigned long long*)&fr.rdx; break;
@@ -618,13 +772,41 @@ static int call_in_target(pid_t pid, struct user_regs_struct *saved,
                 case 15: slot = (unsigned long long*)&fr.r15; break;
             }
             if (!slot) break;
+            if (*slot != 0) break; /* base isn't actually null — a different, unknown bug: don't guess */
+
+            /* This null pointer is confirmed (empirically, on 7.93 PL101) to
+             * be LocFunc_FillEnqueStruct's "current user" source struct:
+             * mandt/client at +0x00..+0x05 (6 bytes, UTF-16) and uname/
+             * username at +0x06..+0x1D (up to 12 UTF-16 chars, null-padded).
+             * Everything else it reads (ucaObj/ucaName/ucaTcode) comes from
+             * fixed constants elsewhere in the binary, not from this struct.
+             * An all-zero stand-in lets the call complete without crashing,
+             * but leaves the lock-owner fields empty (client="000", uname="")
+             * — populate them with real values instead, since it's free and
+             * strictly more correct: the actual client (already sitting at
+             * scratch_rw+0x000 for the real call's own client_ptr argument)
+             * and "SAP*" as the username placeholder. Rest of the buffer
+             * stays zero (padding). Note: this alone does not guarantee
+             * rc==RC_OK — a separate, unrelated real-dispatch-only
+             * dependency elsewhere in password generation (secure-store key
+             * read) can independently produce INTERNAL_ERR regardless of
+             * what's in this buffer; see the rc==1 hint further down. */
+            uintptr_t safe_buf = scratch_rw + NULL_SAFE_BUF_OFFSET;
+            uint8_t mandt_bytes[6];
+            mem_read(pid, scratch_rw + 0x000, mandt_bytes, sizeof(mandt_bytes));
+            mem_write_rw(pid, safe_buf + 0x00, mandt_bytes, sizeof(mandt_bytes));
+            static const uint16_t sapstar_u16[4] = { 'S', 'A', 'P', '*' };
+            mem_write_rw(pid, safe_buf + 0x06, sapstar_u16, sizeof(sapstar_u16));
 
             fprintf(stderr,
                 "[*] Recovered from expected null-deref at 0x%llx "
-                "(zeroed reg #%d, skipped %d bytes, %d attempt(s) left)\n",
-                fr.rip, reg_idx, ilen, recover_budget - 1);
-            *slot = 0;
-            fr.rip += ilen;
+                "(redirected reg #%d from null to a populated stand-in "
+                "buffer — client + \"SAP*\" username, %d attempt(s) left)\n",
+                fr.rip, base_reg_idx, recover_budget - 1);
+            *slot = safe_buf;
+            /* rip left unchanged — the same instruction re-executes, this
+             * time against valid, populated memory, and any later reads
+             * through the same register at other offsets succeed too. */
             ptrace(PTRACE_SETREGS, pid, 0, &fr);
             recover_budget--;
         }
@@ -727,6 +909,16 @@ static void usage(const char *p) {
 "                   doesn't happen (e.g. an already-warmed worker, or a\n"
 "                   kernel build that never hits this path). Pass this flag\n"
 "                   to disable it and see the raw crash instead.\n"
+"  --no-force-locale  On by default: calls setlocale(LC_ALL,\"C\") in the\n"
+"                   target process before creating. Originally added on an\n"
+"                   empirical lead for an unexplained INTERNAL_ERR; tested\n"
+"                   and disproven as the actual fix (see rc==1's hint for\n"
+"                   the confirmed root cause — a real-dispatch-only\n"
+"                   dependency in the secure-store key read, unrelated to\n"
+"                   locale). Left on by default anyway since it's idempotent\n"
+"                   and process-global — harmless even though it isn't the\n"
+"                   fix for anything currently known. Pass this flag to\n"
+"                   disable if you'd rather not touch the target's locale.\n"
 "  -e <path>      Path to disp+work binary for symbol resolution\n"
 "  -p <hint>      Substring to filter disp+work exe path (multi-SID hosts)\n"
 "  --pid <pid>    Target this PID directly, skipping the work-process scan\n"
@@ -768,6 +960,8 @@ int main(int argc, char *argv[]) {
     int  patch_enque   = 1; /* on by default — only intervenes on a live-verified
                               * known-safe crash, no-op otherwise. See
                               * --no-patch-enque-crash to disable. */
+    int  force_locale  = 1; /* on by default — setlocale(LC_ALL,"C") before
+                              * calling. See --no-force-locale to disable. */
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i],"-c") && i+1<argc) { client   = argv[++i]; }
@@ -784,6 +978,7 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i],"--set-session"))   { set_session = 1; }
         else if (!strcmp(argv[i],"--fill-global-areas")) { fill_areas = 1; }
         else if (!strcmp(argv[i],"--no-patch-enque-crash")) { patch_enque = 0; }
+        else if (!strcmp(argv[i],"--no-force-locale")) { force_locale = 0; }
         else if (!strcmp(argv[i],"-q"))              { quiet     = 1; }
         else if (!strcmp(argv[i],"-h"))              { usage(argv[0]); }
         else { fprintf(stderr,"Unknown: %s\n",argv[i]); usage(argv[0]); }
@@ -818,9 +1013,10 @@ int main(int argc, char *argv[]) {
     const char *sym_names[] = { SYM_ANCHOR, SYM_SAPSTAR, SYM_INTERNAL,
                                  SYM_WHOAMI, SYM_VIRT_HDL, SYM_AUDIT_LOG,
                                  SYM_DISABLED, SYM_SET_SESSION, SYM_GLOBAL_AREAS,
-                                 SYM_FILLENQUE, SYM_AUDIT_LOG_ALT };
-    uintptr_t sym_off[11];
-    elf_resolve_symbols(elf_path, sym_names, sym_off, 11);
+                                 SYM_FILLENQUE, SYM_AUDIT_LOG_ALT,
+                                 SYM_INFO_VSAPSTAR, SYM_VEC_DTOR };
+    uintptr_t sym_off[13];
+    elf_resolve_symbols(elf_path, sym_names, sym_off, 13);
     uintptr_t off_anchor   = sym_off[0];
     uintptr_t off_sapstar  = sym_off[1];
     uintptr_t off_internal = sym_off[2];
@@ -832,6 +1028,8 @@ int main(int argc, char *argv[]) {
     uintptr_t off_global_areas = sym_off[8];
     uintptr_t off_fillenque = sym_off[9];
     uintptr_t off_audit_alt = sym_off[10];
+    uintptr_t off_info_vsapstar = sym_off[11];
+    uintptr_t off_vec_dtor = sym_off[12];
 
     if (off_anchor && off_sapstar && off_internal) {
         if (!quiet) printf("[*] Symbols resolved from ELF\n");
@@ -961,6 +1159,71 @@ int main(int argc, char *argv[]) {
      * PTRACE_POKETEXT bypasses r-x page permissions; process_vm_writev cannot.
      */
     uintptr_t trap_site = syscall_site;  /* reuse known-good text location */
+
+    /* ── Force target locale to C/POSIX (on by default, --no-force-locale) ──
+     * See GLIBC_LC_ALL comment above for the empirical evidence behind this.
+     * setlocale isn't in disp+work's own symtab with a usable address (it's
+     * an external/PLT-imported symbol, shows up as UNDEFINED there) — resolve
+     * its PLT stub instead via find_plt_entry, same technique sap_audit_hook
+     * already uses for fwrite.
+     */
+    if (force_locale) {
+        uintptr_t off_setlocale_plt = find_plt_entry(elf_path, "setlocale");
+        if (off_setlocale_plt) {
+            static const char c_locale_str[2] = { 'C', '\0' };
+            mem_write_rw(pid, (uintptr_t)scratch + LOCALE_STR_OFFSET,
+                         c_locale_str, sizeof(c_locale_str));
+            int locale_ok = 0;
+            call_in_target(pid, &saved, (uintptr_t)scratch, trap_site,
+                            base + off_setlocale_plt,
+                            GLIBC_LC_ALL, (uintptr_t)scratch + LOCALE_STR_OFFSET,
+                            0, 0, singlestep, base, &locale_ok, 0, 0);
+            if (locale_ok) {
+                if (!quiet) printf("[*] Target locale forced to C/POSIX\n");
+            } else if (!quiet) {
+                printf("[!] setlocale(LC_ALL,\"C\") call didn't return cleanly — "
+                       "continuing without it\n");
+            }
+        } else if (!quiet) {
+            printf("[*] setlocale not found in this binary's PLT — skipping "
+                   "locale fix (not needed, or a different build)\n");
+        }
+    }
+
+    /* ── Pre-flight check: existing entries in the shared virtual-users table ──
+     * Advisory only — read-only call to info_virtual_sapstar(), never blocks
+     * creation. See SYM_INFO_VSAPSTAR comment above for why this exists.
+     */
+    if (off_info_vsapstar) {
+        uint8_t zero_precheck[PRECHECK_ARG_OFFSET - PRECHECK_VEC_OFFSET + 0x40] = {0};
+        mem_write_rw(pid, (uintptr_t)scratch + PRECHECK_VEC_OFFSET, zero_precheck, sizeof(zero_precheck));
+
+        int precheck_ok = 0;
+        call_in_target(pid, &saved, (uintptr_t)scratch, trap_site,
+                        base + off_info_vsapstar,
+                        (uintptr_t)scratch + PRECHECK_VEC_OFFSET,
+                        (uintptr_t)scratch + PRECHECK_ARG_OFFSET,
+                        0, 0, singlestep, base, &precheck_ok, 0, 0);
+        if (precheck_ok) {
+            uint64_t vec_ptrs[3] = {0};
+            mem_read(pid, (uintptr_t)scratch + PRECHECK_VEC_OFFSET, vec_ptrs, sizeof(vec_ptrs));
+            if (vec_ptrs[1] != vec_ptrs[0]) {
+                fprintf(stderr,
+                    "[*] Pre-flight: existing entry/entries found in the shared\n"
+                    "    virtual-users table — informational only, this does not\n"
+                    "    block or affect creation below.\n");
+            }
+            if (off_vec_dtor) {
+                /* Free the vector's internal heap buffer in the target process
+                 * — info_virtual_sapstar allocated it, we're responsible for
+                 * not leaking it. */
+                call_in_target(pid, &saved, (uintptr_t)scratch, trap_site,
+                                base + off_vec_dtor,
+                                (uintptr_t)scratch + PRECHECK_VEC_OFFSET,
+                                0, 0, 0, singlestep, base, NULL, 0, 0);
+            }
+        }
+    }
 
     /* ── Optionally suppress audit log (--no-audit) ─────────────────────
      * virtual_user_audit_log_create is called unconditionally inside
@@ -1304,6 +1567,22 @@ int main(int argc, char *argv[]) {
                                    "    exist in client %s.\n", client);
         if (rc==7) fprintf(stderr, "    Hint: client %s not found, or purpose-%d username\n"
                                    "    does not exist in this client.\n", client, purpose);
+        if (rc==1) fprintf(stderr,
+                                   "    Hint: INTERNAL_ERR is a catch-all — several different\n"
+                                   "    internal checks map to it. Confirmed root cause on one\n"
+                                   "    system: this call's password generation reads an HMAC key\n"
+                                   "    from SAP's secure store and depends on per-task dispatch\n"
+                                   "    context (session attach, DB connection state) that's only\n"
+                                   "    established by SAP's real request dispatcher — which this\n"
+                                   "    tool's ptrace injection bypasses. On an instance where\n"
+                                   "    Virtual SAP* has never been used before, the very first\n"
+                                   "    attempt can fail this way. Not a bug in this tool, and not\n"
+                                   "    fixable by patching around it further.\n"
+                                   "    Workaround: run real dpmon's create option once against\n"
+                                   "    this instance first (any client/validity). Whatever gets\n"
+                                   "    warmed by that persists for the life of the kernel\n"
+                                   "    processes — every vsapstar call after that first real use\n"
+                                   "    works reliably.\n");
     }
 
 cleanup:
