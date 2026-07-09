@@ -10,7 +10,7 @@
 
 ## What Is This
 
-SAP NetWeaver ships with an emergency super-user mechanism called **Virtual SAP\***. It creates a temporary, fully privileged SAP\* account — with `SAP_ALL` authorizations — that lives only in process memory. No database record. Not visible in user management. No change document.
+SAP NetWeaver/ABAP Platform/... (let's call the it ABAP Stack) ships with an emergency super-user mechanism called **Virtual SAP\***. It creates a temporary, fully privileged SAP\* account — with `SAP_ALL` authorizations — that lives only in process memory. No database record. Not visible in user management. No change document.
 
 SAP intended this feature to be controlled by a profile parameter (`login/create_virtual_user_sapstar`) and to always leave an audit log entry when used.
 
