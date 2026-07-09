@@ -28,9 +28,11 @@ A standalone C binary that creates a Virtual SAP\* account by injecting a functi
 
 Capabilities:
 - **Create** a Virtual SAP\* account without touching any SAP-provided tool
-- **Suppress the audit log entry** — patches the two `call virtual_user_audit_log_create` sites to NOP before the call, restores them after. The Security Audit Log sees nothing.
-- **Bypass `login/create_virtual_user_sapstar = 0`** — the profile parameter that is supposed to prevent this feature from being used. Patched from `JE` to `JMP`, restored after the call.
+- **Suppress the audit log entry** — patches the audit-write call site(s) to NOP before the call, restores after. Resolved at runtime by ELF symbol, with an automatic fallback if the target kernel doesn't wrap the write in `virtual_user_audit_log_create` (some builds call the low-level writer, `rsauwri2ex`, directly instead). The Security Audit Log sees nothing either way.
+- **Bypass `login/create_virtual_user_sapstar = 0`** — the profile parameter that is supposed to prevent this feature from being used. Patched from `JE` to `JMP`, restored after the call. On kernels that predate [SAP Note 3633474](https://me.sap.com/notes/3633474) (before 7.93 PL321 / 9.16 PL60), this parameter doesn't exist yet — the tool detects that and just continues, since there's nothing to bypass.
 - **Extend validity to 7 days** — `dpmon` caps validity at 10–30 minutes. The underlying kernel function accepts up to 10,080 minutes. We call it directly.
+- **Self-contained across kernel builds** — every hook point is resolved by ELF symbol name, not a hardcoded offset. Where a kernel build changes the surrounding code enough that a byte-level patch site can't be dynamically located and verified, the tool aborts with an explanation rather than guessing an offset and corrupting the target process.
+- **Recovers from a known enqueue-lock crash on some builds automatically** — on select kernel patch levels, `create_virtual_sapstar`'s internal enqueue-lock helper (`LocFunc_FillEnqueStruct`, reached via a lazy crypto self-test during password generation) dereferences a per-task pointer that's only populated during real dispatcher-driven requests, which raw injection never sets up. On by default (`--no-patch-enque-crash` to disable): if the call hits that exact, live-verified fault, the tool steps over the one bad instruction and lets the real call complete. No effect on builds/worker states where the fault doesn't occur.
 
 ```
 ./vsapstar -c 100 -v 10 -q
@@ -46,7 +48,7 @@ login/create_virtual_user_sapstar=0 ignored
 ```
 
 > [!NOTE]  
-> Confirmed on SAP kernel 916 / S/4HANA 2023 and 2025.
+> Confirmed on SAP kernel 916 / S/4HANA 2023 and 2025, and separately on SAP kernel 7.93 PL101 (SLES15 SP6). The ELF-symbol-based resolution and live crash recovery are designed to generalize to other kernel builds/patch levels without code changes, but only these have been tested end-to-end.
 
 
 
@@ -105,12 +107,26 @@ newer than the target SAP host's, e.g. SLES15 SP6 ships glibc 2.31).
 Usage: vsapstar [OPTIONS]
 
   -c <client>          SAP client (3 digits)
-  -v <minutes>         Validity in minutes (1–10080)
+  -v <minutes>         Validity in minutes — 10-30 normally, 0-10080 (7 days) with --bypass
   -q                   Quiet: print only the 40-char password
+  -e <path>            Path to disp+work binary for symbol resolution
+  -p <hint>            Substring to filter disp+work exe path (multi-SID hosts)
+  --pid <pid>          Target this PID directly, skipping the work-process scan
   --bypass             Call create_virtual_user_internal directly (enables -P, -v >30)
   -P <purpose>         Purpose (1/2/3) — requires --bypass. Use 2 for SAP GUI login.
-  --no-audit           NOP the audit log call sites (suppress EUP event)
-  --no-profile-check   Bypass login/create_virtual_user_sapstar gate
+  --no-audit           NOP the audit log call site(s) (suppress EUP event)
+  --no-profile-check   Bypass login/create_virtual_user_sapstar gate (no-op, not an
+                       error, on kernels that predate this parameter)
+  --no-patch-enque-crash  Disable the automatic enqueue-lock crash recovery
+                       (on by default) to see the raw crash instead
+  --force-legacy-offsets  Use hardcoded kernel-916 nm offsets when ELF symbol
+                       lookup fails, instead of aborting. Unsafe on a kernel
+                       build the offsets weren't taken from — only use if
+                       you've independently verified the binary layout matches
+  --set-session        Fallback for a different missing-context crash than the
+                       one --no-patch-enque-crash already handles (see --help)
+  --fill-global-areas  Same category as --set-session — documented fallback,
+                       not needed on tested builds (see --help)
   --monitor            Attach and monitor without creating anything
   --singlestep         Verbose register trace (debugging)
 ```
@@ -129,6 +145,8 @@ PW=$(./vsapstar -c 100 -v 10 -q)
 ```
 
 **Requires:** `<sid>adm` shell, `/proc/sys/kernel/yama/ptrace_scope` ≤ 1.
+
+Run `./vsapstar -h` for the full option reference — each flag's help text explains what it does, why it exists, and (for the fallback/diagnostic ones) what was actually tested.
 
 ### `sap_audit_hook`
 
